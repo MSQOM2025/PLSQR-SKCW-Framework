@@ -2,7 +2,7 @@
 
 Reference Python implementation for the manuscript:
 
-> **Decoupling Resolution from Ill-Conditioning in Large-Scale Inverse Retarded Stochastic Itô–Volterra Systems: A Matrix-Free Krylov Regularization Approach**  
+> **Matrix-Free Krylov Regularization with Multi-Level Second-Kind Chebyshev Wavelets for Large-Scale Inverse Retarded Stochastic It\^o--Volterra Systems**  
 > M. Salehi, M. Ahmadinia (University of Qom, Iran)
 
 ## Overview
@@ -93,7 +93,7 @@ If you use this code in your research, please cite:
 
 ```bibtex
 @article{SalehiAhmadinia2026PLSQR,
-  title   = {Decoupling Resolution from Ill-Conditioning in Large-Scale Inverse Retarded Stochastic It\^o--Volterra Systems: A Matrix-Free Krylov Regularization Approach},
+  title   = {{Matrix-Free Krylov Regularization with Multi-Level Second-Kind Chebyshev Wavelets for Large-Scale Inverse Retarded Stochastic It\^o--Volterra Systems},
   author  = {Salehi, M. and Ahmadinia, M.},
   year    = {2026},
   note    = {Manuscript under review}
