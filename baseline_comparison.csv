@@ -1,0 +1,12 @@
+Method,Iterations,StopReason,RelError,Time_s
+"PLSQR--ML-SKCW (s=0.20, DSC)",30,DSC,4.423030e-02,0.0797
+Unprecond. LSQR/CGLS + DSC,49,DSC,9.846241e-02,0.1201
+"Tikhonov-LSQR (lam=1e-03, lim=300)",300,max_iter,2.620009e-01,0.7429
+"Tikhonov-LSQR (lam=1e-02, lim=300)",300,max_iter,9.169629e-02,0.8730
+"Tikhonov-LSQR (lam=1e-02, lim=30)",30,max_iter,1.184145e-01,0.0752
+"Tikhonov-LSQR (lam=5e-02, lim=300)",162,tol(A^Tr),1.128260e-01,0.4056
+"HDP-Tikhonov-LSQR (lam=5e-03, lim=300)",233,tol(A^Tr),3.170169e-02,0.5937
+"HDP-Tikhonov-LSQR (lam=5e-03, lim=30)",30,max_iter,5.198732e-02,0.0774
+"HDP-Tikhonov-LSQR (lam=1e-02, lim=300)",134,tol(A^Tr),6.570791e-02,0.3360
+"HDP-Tikhonov-LSQR (lam=1e-02, lim=30)",30,max_iter,7.317081e-02,0.0770
+"HDP-Tikhonov-LSQR (lam=2e-02, lim=300)",80,tol(A^Tr),1.124306e-01,0.2016

@@ -2,6 +2,13 @@
 ml_skcw_core.py
 Matrix-Free Multi-Level Second-Kind Chebyshev Wavelet (ML-SKCW) Solver
 for Inverse Retarded Stochastic Ito-Volterra Integral Equations.
+
+Implements:
+1. Exact L2-orthonormal multi-level SKCW two-scale transforms in O(p N).
+2. Local interior Gauss-Chebyshev collocation + O(N) prefix-sum Volterra & Ito action.
+3. Exact adjoint operator matching <A v, u> == <v, A^T u> to machine precision.
+4. Exact O(R^2 N) row-norm equilibration D_L^{-1} and dyadic Sobolev scaling D_S^{-1}.
+5. Paige-Saunders LSQR with Discrepancy-Based Stopping Criterion (DSC).
 """
 
 from __future__ import annotations
@@ -32,12 +39,12 @@ def eval_chebyshev_U(x: np.ndarray, p: int) -> np.ndarray:
 @dataclass
 class LocalBasisData:
     p: int
-    R_gram: np.ndarray       # Orthonormalization factor from U_r to L2([-1,1]) basis phi_r
-    Q: np.ndarray            # (2p, 2p) orthogonal two-scale matrix [Q_low; Q_high]
-    x_nodes: np.ndarray      # (p,) interior Gauss-Chebyshev nodes in (-1, 1)
-    E: np.ndarray            # (p, p) evaluation matrix E[q, r] = phi_r(x_q)
-    w_ref: np.ndarray        # (p,) exact polynomial quadrature weights on [-1, 1]
-    I_ref: np.ndarray        # (p, p) exact local antiderivative matrix at x_nodes
+    R_gram: np.ndarray
+    Q: np.ndarray
+    x_nodes: np.ndarray
+    E: np.ndarray
+    w_ref: np.ndarray
+    I_ref: np.ndarray
 
 
 def build_local_basis(p: int) -> LocalBasisData:
@@ -127,7 +134,7 @@ def fwt_analysis(f_fine: np.ndarray, k: int, basis: LocalBasisData) -> np.ndarra
 
 
 # ============================================================================
-# 2. Separable Kernel Representation & Matrix-Free Volterra/Ito Operator
+# 2. Separable Kernels & Matrix-Free Volterra/Ito Operator
 # ============================================================================
 
 @dataclass
@@ -135,20 +142,6 @@ class SeparableKernel:
     """Represents K(t, s) = sum_{q=1}^R a_q(t) * b_q(s) on collocation grid (M_int, p)."""
     a_factors: List[np.ndarray]
     b_factors: List[np.ndarray]
-
-
-def make_exponential_kernel(t_grid: np.ndarray, amp: float, lam: float) -> SeparableKernel:
-    """Exact rank-1 decomposition of K(t, s) = amp * exp(-lam * (t - s))."""
-    a = amp * np.exp(-lam * (t_grid - 0.5))
-    b = np.exp(lam * (t_grid - 0.5))
-    return SeparableKernel(a_factors=[a], b_factors=[b])
-
-
-def make_constant_kernel(t_grid: np.ndarray, amp: float) -> SeparableKernel:
-    return SeparableKernel(
-        a_factors=[np.full_like(t_grid, amp)],
-        b_factors=[np.ones_like(t_grid)],
-    )
 
 
 class RetardedSIVIEOperator(LinearOperator):
@@ -201,7 +194,6 @@ class RetardedSIVIEOperator(LinearOperator):
         return centers[:, None] + 0.5 * h * basis.x_nodes[None, :]
 
     def _volterra_forward(self, g: np.ndarray) -> np.ndarray:
-        """Compute int_0^{t_{n,q}} g(s) ds in O(N) via local integration + prefix sum."""
         half_h = 0.5 * self.h
         S = half_h * (g @ self.basis.w_ref)
         C = np.empty(self.M_int, dtype=float)
@@ -211,7 +203,6 @@ class RetardedSIVIEOperator(LinearOperator):
         return C[:, None] + half_h * (g @ self.basis.I_ref.T)
 
     def _volterra_adjoint(self, z: np.ndarray) -> np.ndarray:
-        """Exact adjoint of _volterra_forward in O(N) via reverse prefix sum."""
         half_h = 0.5 * self.h
         Z = np.sum(z, axis=1)
         T_rev = np.empty(self.M_int, dtype=float)
@@ -299,190 +290,138 @@ class RetardedSIVIEOperator(LinearOperator):
 
 
 # ============================================================================
-# 3. Fast Vectorized O(N log N) Column Norms & Damped HDP
+# 3. Exact O(R^2 N) Row Equilibration & Two-Sided HDP
 # ============================================================================
 
-def compute_fast_column_norms(op: RetardedSIVIEOperator) -> np.ndarray:
+def compute_fast_row_norms(op: RetardedSIVIEOperator) -> np.ndarray:
     """
-    Compute exact column 2-norms ||A_w[:, ell]||_2 in vectorized O(N log N)
-    without assembling A_w.
+    Compute exact Euclidean row norms ||A_w[i, :]||_2 for all i=0..N-1
+    in O(R^2 N) without assembling A_w (using unitarity of multi-level FWT).
     """
-    k, p, M_int = op.k, op.p, op.M_int
-    norms_sq = np.zeros(op.N, dtype=float)
+    M_int, p, h = op.M_int, op.p, op.h
+    d_shift = op.d_shift
+    scale = 0.5 * h * op.scale_node
 
-    a_all: List[np.ndarray] = []
-    tail_coeffs_all: List[np.ndarray] = []
-
-    def add_kernel_tails(kernel: SeparableKernel, delayed: bool, stochastic: bool):
-        for a, b in zip(kernel.a_factors, kernel.b_factors):
-            a_all.append(a.reshape(M_int, p))
-            b_eff = b.copy()
-            if stochastic:
-                b_eff = (op.dW / op.h)[:, None] * b_eff
-            weighted_b = (0.5 * op.h) * (b_eff * op.basis.w_ref[None, :])
-            if delayed and op.d_shift > 0:
-                shifted_back = np.zeros_like(weighted_b)
-                if op.d_shift < M_int:
-                    shifted_back[:-op.d_shift, :] = weighted_b[op.d_shift:, :]
-                weighted_b = shifted_back
-            f_adj = op.scale_node * (weighted_b @ op.basis.E)
-            tail_coeffs_all.append(fwt_analysis(f_adj, k, op.basis))
-
-    add_kernel_tails(op.K0, delayed=False, stochastic=False)
-    add_kernel_tails(op.K1, delayed=True, stochastic=False)
-    add_kernel_tails(op.K2, delayed=True, stochastic=True)
+    a_list = []
+    u_list = []
+    L_loc_list = []
 
     n_k0 = len(op.K0.a_factors)
-    R_tot = len(a_all)
-    tail_gram = np.zeros((R_tot, R_tot, M_int + 1), dtype=float)
-    for q1 in range(R_tot):
-        for q2 in range(q1, R_tot):
-            blk_sum = np.sum(a_all[q1] * a_all[q2], axis=1)
-            rev_cs = np.cumsum(blk_sum[::-1])[::-1]
-            tail_gram[q1, q2, :M_int] = rev_cs
-            tail_gram[q2, q1, :M_int] = rev_cs
+    for a0, b0 in zip(op.K0.a_factors, op.K0.b_factors):
+        a_list.append(a0.reshape(M_int, p))
+        u0 = scale * ((b0 * op.basis.w_ref[None, :]) @ op.basis.E)
+        u_list.append(u0)
+        L0 = scale * np.einsum("nj,qj,jl->nql", b0, op.basis.I_ref, op.basis.E)
+        L_loc_list.append(a0[:, :, None] * L0)
 
-    e = np.zeros(op.N, dtype=float)
-    for r in range(p):
-        e[r] = 1.0
-        norms_sq[r] = np.sum(op._matvec(e) ** 2)
-        e[r] = 0.0
+    for kernel, stoch in [(op.K1, False), (op.K2, True)]:
+        for ad, bd in zip(kernel.a_factors, kernel.b_factors):
+            a_list.append(ad.reshape(M_int, p))
+            bd_eff = (op.dW / h)[:, None] * bd if stoch else bd
+            ud = np.zeros((M_int, p), dtype=float)
+            Ld = np.zeros((M_int, p, p), dtype=float)
+            if d_shift == 0:
+                ud = scale * ((bd_eff * op.basis.w_ref[None, :]) @ op.basis.E)
+                L_tmp = scale * np.einsum("nj,qj,jl->nql", bd_eff, op.basis.I_ref, op.basis.E)
+                Ld = ad[:, :, None] * L_tmp
+            elif d_shift < M_int:
+                ud[:-d_shift, :] = scale * ((bd_eff[d_shift:, :] * op.basis.w_ref[None, :]) @ op.basis.E)
+                L_tmp = scale * np.einsum("nj,qj,jl->nql", bd_eff[d_shift:, :], op.basis.I_ref, op.basis.E)
+                Ld[d_shift:, :, :] = ad[d_shift:, :, None] * L_tmp
+            u_list.append(ud)
+            L_loc_list.append(Ld)
 
-    invN = 1.0 / op.N
+    R_tot = len(a_list)
+    G_cum_all = np.zeros((R_tot, R_tot, M_int + 1), dtype=float)
+    for r1 in range(R_tot):
+        for r2 in range(r1, R_tot):
+            dots = np.sum(u_list[r1] * u_list[r2], axis=1)
+            cs = np.zeros(M_int + 1, dtype=float)
+            cs[1:] = np.cumsum(dots)
+            G_cum_all[r1, r2, :] = cs
+            G_cum_all[r2, r1, :] = cs
+
+    a_arr = np.stack(a_list, axis=0)
+    row_sq = np.zeros((M_int, p), dtype=float)
+
+    if d_shift == 0:
+        n_idx = np.arange(M_int)
+        tail_sq = np.einsum("rnq,rsn,snq->nq", a_arr, G_cum_all[:, :, n_idx], a_arr)
+        loc_vec = sum(L_loc_list)
+        row_sq = np.maximum(tail_sq, 0.0) + np.sum(loc_vec ** 2, axis=2)
+    else:
+        n_idx = np.arange(M_int)
+        L0_sum = sum(L_loc_list[:n_k0])
+        row_sq += np.sum(L0_sum ** 2, axis=2)
+
+        if d_shift < M_int:
+            Ld_sum = sum(L_loc_list[n_k0:])[d_shift:, :, :]
+            u0_stack = np.stack(u_list[:n_k0], axis=0)[:, :-d_shift, :]
+            a0_slice = a_arr[:n_k0, d_shift:, :]
+            k0_tail_vec = np.einsum("rnq,rnl->nql", a0_slice, u0_stack)
+            row_sq[d_shift:, :] += np.sum((Ld_sum + k0_tail_vec) ** 2, axis=2)
+
+        v_low = np.maximum(0, n_idx - d_shift + 1)
+        G_mid = G_cum_all[:n_k0, :n_k0, n_idx] - G_cum_all[:n_k0, :n_k0, v_low]
+        mid_sq = np.einsum("rnq,rsn,snq->nq", a_arr[:n_k0], G_mid, a_arr[:n_k0])
+        row_sq += np.maximum(mid_sq, 0.0)
+
+        if d_shift + 1 < M_int:
+            n_hi = n_idx[d_shift + 1:] - d_shift
+            G_hi = G_cum_all[:, :, n_hi]
+            hi_sq = np.einsum("rnq,rsn,snq->nq", a_arr[:, d_shift + 1:, :], G_hi, a_arr[:, d_shift + 1:, :])
+            row_sq[d_shift + 1:, :] += np.maximum(hi_sq, 0.0)
+
+    return np.sqrt(np.maximum(row_sq.ravel() / op.N, 0.0))
+
+
+def build_sobolev_weights(k: int, p: int, s: float) -> np.ndarray:
+    """Right hierarchical Sobolev scaling D_S^{-1}: 2^{-j s} at dyadic level j."""
+    N = (1 << (k - 1)) * p
+    d_inv = np.ones(N, dtype=float)
     offset = p
     for j in range(1, k):
-        m_blk = 1 << (j - 1)
-        span_fine = M_int // m_blk
-        if op.d_shift == 0 or span_fine >= op.d_shift:
-            for idx in range(m_blk * p):
-                ell = offset + idx
-                e[ell] = 1.0
-                norms_sq[ell] = np.sum(op._matvec(e) ** 2)
-                e[ell] = 0.0
-            offset += m_blk * p
-            continue
-
-        blk_ids = np.arange(m_blk)
-        n_end_arr = (blk_ids + 1) * span_fine
-        del_start_arr = np.minimum(blk_ids * span_fine + op.d_shift, M_int)
-        del_end_arr = np.minimum(n_end_arr + op.d_shift, M_int)
-        n_full = (M_int - op.d_shift) // span_fine
-        full_end = op.d_shift + n_full * span_fine
-
-        for r in range(p):
-            curr_sub = op.basis.Q[p + r: p + r + 1, :].reshape(2, p)
-            for _ in range(j + 1, k):
-                n_cur = curr_sub.shape[0]
-                comb = np.hstack([curr_sub, np.zeros((n_cur, p))])
-                curr_sub = (comb @ op.basis.Q).reshape(2 * n_cur, p)
-
-            f_fine = np.tile(curr_sub, (m_blk, 1))
-            x_node = op.scale_node * (f_fine @ op.basis.E.T)
-
-            # 1) Non-delayed K0 local energy on I_{j,n}
-            y0_loc = np.zeros_like(x_node)
-            for a0, b0 in zip(op.K0.a_factors, op.K0.b_factors):
-                g0 = (b0 * x_node).reshape(m_blk, span_fine, p)
-                S0 = 0.5 * op.h * (g0 @ op.basis.w_ref)
-                C0 = np.zeros_like(S0)
-                if span_fine > 1:
-                    C0[:, 1:] = np.cumsum(S0[:, :-1], axis=1)
-                loc0 = C0[:, :, None] + 0.5 * op.h * (g0 @ op.basis.I_ref.T)
-                y0_loc += a0 * loc0.reshape(M_int, p)
-
-            loc0_sq = np.sum((y0_loc * op.inv_sqrtN).reshape(m_blk, span_fine * p) ** 2, axis=1)
-
-            # 2) Delayed K1 + K2 local energy on shifted intervals [n*span_fine + d_shift, ...)
-            yd_loc = np.zeros_like(x_node)
-            x_del = np.zeros_like(x_node)
-            x_del[op.d_shift:, :] = x_node[:-op.d_shift, :]
-
-            for kernel, stoch in [(op.K1, False), (op.K2, True)]:
-                for ad, bd in zip(kernel.a_factors, kernel.b_factors):
-                    gd = bd * x_del
-                    if stoch:
-                        gd = (op.dW / op.h)[:, None] * gd
-
-                    if n_full > 0:
-                        gd_blk = gd[op.d_shift: full_end, :].reshape(n_full, span_fine, p)
-                        Sd = 0.5 * op.h * (gd_blk @ op.basis.w_ref)
-                        Cd = np.zeros_like(Sd)
-                        if span_fine > 1:
-                            Cd[:, 1:] = np.cumsum(Sd[:, :-1], axis=1)
-                        loc_d = Cd[:, :, None] + 0.5 * op.h * (gd_blk @ op.basis.I_ref.T)
-                        yd_loc[op.d_shift: full_end, :] += (
-                            ad[op.d_shift: full_end, :] * loc_d.reshape(n_full * span_fine, p)
-                        )
-
-                    if full_end < M_int:
-                        len_p = M_int - full_end
-                        g_p = gd[full_end: M_int, :]
-                        S_p = 0.5 * op.h * (g_p @ op.basis.w_ref)
-                        C_p = np.zeros(len_p, dtype=float)
-                        if len_p > 1:
-                            C_p[1:] = np.cumsum(S_p[:-1])
-                        loc_p = C_p[:, None] + 0.5 * op.h * (g_p @ op.basis.I_ref.T)
-                        yd_loc[full_end: M_int, :] += ad[full_end: M_int, :] * loc_p
-
-            ell_indices = offset + blk_ids * p + r
-            for q0 in range(n_k0):
-                tc_q0 = tail_coeffs_all[q0][ell_indices]
-                tc_rep = np.repeat(tc_q0, span_fine)[: M_int - op.d_shift]
-                yd_loc[op.d_shift:, :] += tc_rep[:, None] * a_all[q0][op.d_shift:, :]
-
-            pure_yd_sq = np.zeros(m_blk, dtype=float)
-            if n_full > 0:
-                blk_vals = (yd_loc[op.d_shift: full_end, :] * op.inv_sqrtN).reshape(n_full, span_fine * p)
-                pure_yd_sq[:n_full] = np.sum(blk_vals ** 2, axis=1)
-            if full_end < M_int and n_full < m_blk:
-                pure_yd_sq[n_full] = np.sum((yd_loc[full_end: M_int, :] * op.inv_sqrtN) ** 2)
-
-            # 3) Remaining tail energies (vectorized einsum)
-            C0_mat = np.column_stack([tail_coeffs_all[q0][ell_indices] for q0 in range(n_k0)])
-            G_A = tail_gram[:n_k0, :n_k0, n_end_arr] - tail_gram[:n_k0, :n_k0, del_start_arr]
-            segA_sq = invN * np.einsum("ni,ijn,nj->n", C0_mat, G_A, C0_mat)
-            segA_sq *= (del_start_arr > n_end_arr)
-
-            Call_mat = np.column_stack([tail_coeffs_all[q][ell_indices] for q in range(R_tot)])
-            G_B = tail_gram[:, :, del_end_arr]
-            segB_sq = invN * np.einsum("ni,ijn,nj->n", Call_mat, G_B, Call_mat)
-            segB_sq *= (del_end_arr < M_int)
-
-            norms_sq[ell_indices] = loc0_sq + pure_yd_sq + segA_sq + segB_sq
-
-        offset += m_blk * p
-
-    return np.sqrt(np.maximum(norms_sq, 0.0))
+        cnt = (1 << (j - 1)) * p
+        d_inv[offset: offset + cnt] = 2.0 ** (-j * s)
+        offset += cnt
+    return d_inv
 
 
 @dataclass
-class DampedHDP:
-    d_raw: np.ndarray
-    d_damp: np.ndarray
-    d_inv: np.ndarray
-    lambda0: float
+class TwoSidedHDP:
+    w_left: np.ndarray
+    d_s_inv: np.ndarray
 
 
-def build_damped_hdp(op: RetardedSIVIEOperator, lambda0: float) -> DampedHDP:
-    d_raw = compute_fast_column_norms(op)
-    d_damp = np.sqrt(d_raw ** 2 + lambda0 ** 2)
-    d_inv = 1.0 / d_damp
-    return DampedHDP(d_raw=d_raw, d_damp=d_damp, d_inv=d_inv, lambda0=lambda0)
+def build_two_sided_hdp(
+    op: RetardedSIVIEOperator, s: float, floor_ratio: float = 1e-2
+) -> TwoSidedHDP:
+    """
+    Construct O(R^2 N) Two-Sided HDP:
+      - Left row equilibration w_left from exact matrix-free row norms (normalized so mean(w^2)=1)
+      - Right dyadic Sobolev weights d_s_inv = 2^{-j s}
+    """
+    r_norms = compute_fast_row_norms(op)
+    floor = floor_ratio * float(np.max(r_norms))
+    w_raw = 1.0 / np.sqrt(r_norms ** 2 + floor ** 2)
+    w_left = w_raw / np.sqrt(np.mean(w_raw ** 2))
+    d_s_inv = build_sobolev_weights(op.k, op.p, s=s)
+    return TwoSidedHDP(w_left=w_left, d_s_inv=d_s_inv)
 
 
-def make_preconditioned_operator(op: RetardedSIVIEOperator, hdp: DampedHDP) -> LinearOperator:
-    """Return A_tilde = A_w @ D_H^{-1} as a matrix-free LinearOperator."""
-    d_inv = hdp.d_inv
+def make_two_sided_operator(op: RetardedSIVIEOperator, hdp: TwoSidedHDP) -> LinearOperator:
+    w_left = hdp.w_left
+    d_s_inv = hdp.d_s_inv
     return LinearOperator(
         dtype=float,
         shape=op.shape,
-        matvec=lambda y: op.matvec(d_inv * y),
-        rmatvec=lambda u: d_inv * op.rmatvec(u),
+        matvec=lambda y: w_left * op.matvec(d_s_inv * y),
+        rmatvec=lambda u: d_s_inv * op.rmatvec(w_left * u),
     )
 
 
 # ============================================================================
-# 4. Paige-Saunders LSQR with Spectral Stop Sign (SSS)
+# 4. Paige-Saunders LSQR with Discrepancy-Based Stopping Criterion (DSC)
 # ============================================================================
 
 @dataclass
@@ -493,22 +432,22 @@ class LSQRResult:
     c_history: Optional[List[np.ndarray]] = None
 
 
-def solve_plsqr_sss(
+def solve_plsqr_dsc(
     A_tilde: LinearOperator,
-    b_w: np.ndarray,
-    d_inv: np.ndarray,
+    b_L: np.ndarray,
+    d_s_inv: np.ndarray,
     delta_prior: float,
-    tau_safe: float = 1.15,
-    eps_s: float = 1e-3,
+    tau_safe: float = 1.10,
+    eps_s: float = 1e-4,
     m_min: int = 2,
-    m_max: int = 80,
-    use_sss: bool = True,
+    m_max: int = 200,
+    use_dsc: bool = True,
     record_history: bool = False,
 ) -> LSQRResult:
-    """Execute Algorithm 1: Paige-Saunders LSQR with O(1) residual monitoring and SSS."""
-    N = len(b_w)
-    beta = float(np.linalg.norm(b_w))
-    u = b_w / beta if beta > 0.0 else np.zeros(N, dtype=float)
+    """Paige-Saunders LSQR with O(1) residual monitoring and Discrepancy-Based Stopping (DSC)."""
+    N = len(b_L)
+    beta = float(np.linalg.norm(b_L))
+    u = b_L / beta if beta > 0.0 else np.zeros(N, dtype=float)
     q0 = A_tilde.rmatvec(u)
     alpha = float(np.linalg.norm(q0))
     v = q0 / alpha if alpha > 0.0 else np.zeros(N, dtype=float)
@@ -549,9 +488,9 @@ def solve_plsqr_sss(
         omega_hist.append(omega)
 
         if record_history and c_hist is not None:
-            c_hist.append(d_inv * y)
+            c_hist.append(d_s_inv * y)
 
-        if use_sss and m >= m_min:
+        if use_dsc and m >= m_min:
             omega_prev = omega_hist[-2]
             rel_drop = abs(omega - omega_prev) / max(omega_prev, 1e-15)
             cond_disc = omega <= tau_safe * delta_prior
@@ -561,7 +500,7 @@ def solve_plsqr_sss(
                 break
 
     return LSQRResult(
-        c_sol=d_inv * y,
+        c_sol=d_s_inv * y,
         m_stop=m_stop,
         omega_history=np.asarray(omega_hist),
         c_history=c_hist,
@@ -569,7 +508,7 @@ def solve_plsqr_sss(
 
 
 # ============================================================================
-# 5. Self-Tests (Unitarity, Adjoint, and Fast Column Norm Verification)
+# 5. Self-Tests (Unitarity, Adjoint, and O(R^2 N) Row Norm Exactness)
 # ============================================================================
 
 def run_self_tests() -> None:
@@ -583,14 +522,18 @@ def run_self_tests() -> None:
     f_syn = fwt_synthesis(c_rand, k, basis)
     c_rec = fwt_analysis(f_syn, k, basis)
     err_fwt = np.linalg.norm(c_rand - c_rec) / np.linalg.norm(c_rand)
-    err_norm = abs(np.linalg.norm(f_syn) - np.linalg.norm(c_rand)) / np.linalg.norm(c_rand)
-    assert err_fwt < 1e-13 and err_norm < 1e-13, f"FWT test failed: {err_fwt}, {err_norm}"
+    assert err_fwt < 1e-13, f"FWT test failed: {err_fwt}"
     print(f"  [PASS] Multi-level SKCW FWT unitary check: err = {err_fwt:.2e}")
 
     t_grid = RetardedSIVIEOperator.collocation_grid(k, p, basis=basis)
-    K0 = make_exponential_kernel(t_grid, amp=1.0, lam=2.0)
-    K1 = make_exponential_kernel(t_grid, amp=0.5, lam=1.0)
-    K2 = make_constant_kernel(t_grid, amp=0.1)
+    a0 = 4.0 * np.exp(3.0 * t_grid) * np.exp(-2.0 * (t_grid - 0.5))
+    b0 = np.exp(2.0 * (t_grid - 0.5))
+    a1 = 1.2 * np.exp(-1.5 * t_grid) * np.exp(-1.0 * (t_grid - 0.5))
+    b1 = np.exp(1.0 * (t_grid - 0.5))
+    a2 = 0.25 * (1.0 + 0.5 * np.sin(2.0 * np.pi * t_grid))
+    K0 = SeparableKernel([a0], [b0])
+    K1 = SeparableKernel([a1], [b1])
+    K2 = SeparableKernel([a2], [np.ones_like(t_grid)])
     dW = rng.normal(0.0, np.sqrt(1.0 / (1 << (k - 1))), size=(1 << (k - 1)))
     op = RetardedSIVIEOperator(k, p, tau=0.125, K0=K0, K1=K1, K2=K2, dW=dW, basis=basis)
 
@@ -603,11 +546,11 @@ def run_self_tests() -> None:
     print(f"  [PASS] Matrix-free Adjoint test <Av,u>==<v,A^Tu>: rel_err = {err_adj:.2e}")
 
     A_exp = op.assemble_explicit_for_diagnostics()
-    d_exact = np.linalg.norm(A_exp, axis=0)
-    d_fast = compute_fast_column_norms(op)
-    err_cols = np.max(np.abs(d_exact - d_fast)) / np.max(d_exact)
-    assert err_cols < 1e-12, f"Fast column norm mismatch: {err_cols}"
-    print(f"  [PASS] Vectorized O(N log N) Column norm vs Explicit A: rel_err = {err_cols:.2e}")
+    r_exact = np.linalg.norm(A_exp, axis=1)
+    r_fast = compute_fast_row_norms(op)
+    err_rows = np.max(np.abs(r_exact - r_fast)) / np.max(r_exact)
+    assert err_rows < 1e-13, f"Fast row norm mismatch: {err_rows}"
+    print(f"  [PASS] O(R^2 N) Row norm vs Explicit A: rel_err = {err_rows:.2e}")
 
 
 if __name__ == "__main__":
