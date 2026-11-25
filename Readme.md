@@ -23,6 +23,7 @@ Key components implemented in this codebase:
 .
 ├── ml_skcw_core.py            # Core ML-SKCW transforms, matrix-free operators, O(R^2 N) HDP, LSQR-DSC, & unit tests
 ├── run_upgraded_benchmarks.py # Reproduces Examples 1–6, Section 7.7–7.8 benchmarks, PDF figures, & CSV tables
+├── test_left_only_rival.py    # Left-only HDP ablation: D_L^{-1} vs. two-sided HDP, DSC and Tikhonov comparisons under moderate and strong stochastic forcing
 ├── baseline_comparison.csv    # Generated baseline comparison results (Section 7.8)
 ├── sensitivity_analysis.csv   # Generated 5-seed hyperparameter sensitivity results (Section 7.8)
 └── README.md
