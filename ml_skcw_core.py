@@ -1,22 +1,25 @@
 """
 ml_skcw_core.py
-Matrix-Free Multi-Level Second-Kind Chebyshev Wavelet (ML-SKCW) Solver
+Matrix-Free Multi-Level L2-Orthonormalized Chebyshev-Seeded Multiwavelet (ML-SKCW) Solver
 for Inverse Retarded Stochastic Ito-Volterra Integral Equations.
 
 Implements:
-1. Exact L2-orthonormal multi-level SKCW two-scale transforms in O(p N).
-2. Local interior Gauss-Chebyshev collocation + O(N) prefix-sum Volterra & Ito action.
-3. Exact adjoint operator matching <A v, u> == <v, A^T u> to machine precision.
+1. Exact L2-orthonormal Alpert-type Chebyshev-seeded multiwavelet FWT in O(p N).
+2. Local interior Gauss-Chebyshev (type-I) collocation + O(R N) prefix-sum Volterra & Ito action.
+3. Chebyshev separable expansion for non-separable smooth kernels (R > 1).
 4. Exact O(R^2 N) row-norm equilibration D_L^{-1} and dyadic Sobolev scaling D_S^{-1}.
-5. Paige-Saunders LSQR with Discrepancy-Based Stopping Criterion (DSC).
+5. O(N) tridiagonal H^1 (s=1) preconditioner baseline via banded Cholesky.
+6. Paige-Saunders LSQR with Discrepancy-Based Stopping Criterion (DSC) and Hybrid Golub-Kahan (DP/GCV).
 """
 
 from __future__ import annotations
 
 import numpy as np
+from scipy.linalg import cholesky_banded, solve_banded
+from scipy.optimize import brentq, minimize_scalar
 from scipy.sparse.linalg import LinearOperator
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 
 # ============================================================================
@@ -25,15 +28,28 @@ from typing import List, Optional
 
 def eval_chebyshev_U(x: np.ndarray, p: int) -> np.ndarray:
     """Evaluate Second-Kind Chebyshev polynomials U_0,...,U_{p-1} at x in [-1, 1]."""
-    x = np.asarray(x, dtype=float)
-    U = np.zeros((x.size, p), dtype=float)
+    x_flat = np.asarray(x, dtype=float).ravel()
+    U = np.zeros((x_flat.size, p), dtype=float)
     if p >= 1:
         U[:, 0] = 1.0
     if p >= 2:
-        U[:, 1] = 2.0 * x
+        U[:, 1] = 2.0 * x_flat
     for r in range(2, p):
-        U[:, r] = 2.0 * x * U[:, r - 1] - U[:, r - 2]
+        U[:, r] = 2.0 * x_flat * U[:, r - 1] - U[:, r - 2]
     return U
+
+
+def eval_chebyshev_T(x: np.ndarray, R: int) -> np.ndarray:
+    """Evaluate First-Kind Chebyshev polynomials T_0,...,T_{R-1} at x in [-1, 1]."""
+    x_flat = np.asarray(x, dtype=float).ravel()
+    T = np.zeros((x_flat.size, R), dtype=float)
+    if R >= 1:
+        T[:, 0] = 1.0
+    if R >= 2:
+        T[:, 1] = x_flat
+    for q in range(2, R):
+        T[:, q] = 2.0 * x_flat * T[:, q - 1] - T[:, q - 2]
+    return T
 
 
 @dataclass
@@ -43,6 +59,8 @@ class LocalBasisData:
     Q: np.ndarray
     x_nodes: np.ndarray
     E: np.ndarray
+    E_inv: np.ndarray
+    E_inv_T: np.ndarray
     w_ref: np.ndarray
     I_ref: np.ndarray
 
@@ -51,7 +69,7 @@ def build_local_basis(p: int) -> LocalBasisData:
     """
     Construct L2([-1, 1])-orthonormal basis spanning {U_0, ..., U_{p-1}},
     its exact orthogonal two-scale multiwavelet refinement matrix Q,
-    and local Gauss-Chebyshev collocation/integration operators.
+    and local Gauss-Chebyshev (type-I) collocation/integration operators.
     """
     xg, wg = np.polynomial.legendre.leggauss(2 * p)
     U_g = eval_chebyshev_U(xg, p)
@@ -82,6 +100,7 @@ def build_local_basis(p: int) -> LocalBasisData:
     x_nodes = -np.cos((2.0 * q_idx + 1.0) * np.pi / (2.0 * p))
     E = eval_phi(x_nodes)
     E_inv = np.linalg.inv(E)
+    E_inv_T = E_inv.T.copy()
 
     int_phi_full = wg @ Phi_u
     w_ref = int_phi_full @ E_inv
@@ -97,7 +116,15 @@ def build_local_basis(p: int) -> LocalBasisData:
     I_ref = Phi_int @ E_inv
 
     return LocalBasisData(
-        p=p, R_gram=R_inv, Q=Q, x_nodes=x_nodes, E=E, w_ref=w_ref, I_ref=I_ref
+        p=p,
+        R_gram=R_inv,
+        Q=Q,
+        x_nodes=x_nodes,
+        E=E,
+        E_inv=E_inv,
+        E_inv_T=E_inv_T,
+        w_ref=w_ref,
+        I_ref=I_ref,
     )
 
 
@@ -144,11 +171,43 @@ class SeparableKernel:
     b_factors: List[np.ndarray]
 
 
+def chebyshev_separable_kernel(
+    kernel_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    t_grid: np.ndarray,
+    R: int,
+    T_end: float = 1.0,
+) -> SeparableKernel:
+    """
+    Construct an R-term Chebyshev interpolation expansion in s:
+      K^{(R)}(t, s) = sum_{q=0}^{R-1} a_q(t) T_q(2s/T_end - 1)
+    on collocation grid t_grid of shape (M_int, p).
+    """
+    m = np.arange(R)
+    x_m = -np.cos((2.0 * m + 1.0) * np.pi / (2.0 * R))
+    s_m = 0.5 * T_end * (x_m + 1.0)
+
+    T_nodes = eval_chebyshev_T(x_m, R)  # (R, R)
+    K_tm = kernel_fn(t_grid[..., None], s_m[None, None, :])  # (M_int, p, R)
+
+    x_grid = (2.0 / T_end) * t_grid - 1.0
+    T_grid = eval_chebyshev_T(x_grid, R).reshape(t_grid.shape[0], t_grid.shape[1], R)
+
+    a_factors: List[np.ndarray] = []
+    b_factors: List[np.ndarray] = []
+    for q in range(R):
+        scale_q = (1.0 / R) if q == 0 else (2.0 / R)
+        a_q = scale_q * np.sum(K_tm * T_nodes[None, None, :, q], axis=2)
+        b_q = T_grid[:, :, q].copy()
+        a_factors.append(a_q)
+        b_factors.append(b_q)
+    return SeparableKernel(a_factors=a_factors, b_factors=b_factors)
+
+
 class RetardedSIVIEOperator(LinearOperator):
     """
-    Matrix-free O(N) LinearOperator for:
-        (K_0 + K_{d,tau} + K_{s,tau}) X = g_phi^delta
-    on ML-SKCW coefficients c in R^N, scaled by 1/sqrt(N).
+    Matrix-free O(R N) LinearOperator for:
+        A_w c = (1/sqrt(N)) (K_0 + K_{d,tau} + K_{s,tau}) X
+    on ML-SKCW coefficients c in R^N.
     """
 
     def __init__(
@@ -185,7 +244,7 @@ class RetardedSIVIEOperator(LinearOperator):
     def collocation_grid(
         k: int, p: int, T_end: float = 1.0, basis: Optional[LocalBasisData] = None
     ) -> np.ndarray:
-        """Return local interior Gauss-Chebyshev nodes of shape (M_int, p) on [0, T_end]."""
+        """Return local interior Gauss-Chebyshev (type-I) nodes of shape (M_int, p) on [0, T_end]."""
         if basis is None:
             basis = build_local_basis(p)
         M_int = 1 << (k - 1)
@@ -251,10 +310,43 @@ class RetardedSIVIEOperator(LinearOperator):
                 out += contrib
         return out
 
+    def eval_history_response(self, phi_vals_at_grid: np.ndarray) -> np.ndarray:
+        """
+        Evaluate the solver-grid history contribution (over 0 <= s < tau_h) for K1 and K2:
+            sum_{u < d_shift} (K1 + K2 dW) phi(t_u - tau_h), scaled by 1/sqrt(N).
+        phi_vals_at_grid must hold phi(t_u - tau) (or phi(t_u - tau_h)) of shape (M_int, p)
+        (only rows < d_shift are used).
+        """
+        out = np.zeros((self.M_int, self.p), dtype=float)
+        if self.d_shift <= 0:
+            return out.ravel()
+        d_lim = min(self.d_shift, self.M_int)
+        x_hist = np.zeros((self.M_int, self.p), dtype=float)
+        x_hist[:d_lim, :] = phi_vals_at_grid[:d_lim, :]
+        for kernel, stoch in [(self.K1, False), (self.K2, True)]:
+            for a, b in zip(kernel.a_factors, kernel.b_factors):
+                g = b * x_hist
+                if stoch:
+                    g = (self.dW / self.h)[:, None] * g
+                out += a * self._volterra_forward(g)
+        return self.inv_sqrtN * out.ravel()
+
     def eval_basis_at_nodes(self, c: np.ndarray) -> np.ndarray:
         """Evaluate X_N(t) = c^T Psi(t) at local collocation nodes (M_int, p)."""
         f_fine = fwt_synthesis(c, self.k, self.basis)
         return self.scale_node * (f_fine @ self.basis.E.T)
+
+    def nodes_to_coeffs(self, x_node: np.ndarray) -> np.ndarray:
+        """Inverse of eval_basis_at_nodes: nodal values (N,) -> wavelet coefficients (N,)."""
+        x_blk = np.asarray(x_node, dtype=float).reshape(self.M_int, self.p)
+        f_fine = (x_blk / self.scale_node) @ self.basis.E_inv_T
+        return fwt_analysis(f_fine, self.k, self.basis)
+
+    def nodes_to_coeffs_adjoint(self, r_c: np.ndarray) -> np.ndarray:
+        """Exact transpose of nodes_to_coeffs: wavelet vector (N,) -> nodal vector (N,)."""
+        f_syn = fwt_synthesis(np.asarray(r_c, dtype=float), self.k, self.basis)
+        x_adj = (f_syn @ self.basis.E_inv) / self.scale_node
+        return x_adj.ravel()
 
     def _matvec(self, c: np.ndarray) -> np.ndarray:
         c = np.asarray(c, dtype=float).ravel()
@@ -398,7 +490,7 @@ def build_two_sided_hdp(
 ) -> TwoSidedHDP:
     """
     Construct O(R^2 N) Two-Sided HDP:
-      - Left row equilibration w_left from exact matrix-free row norms (normalized so mean(w^2)=1)
+      - Left row equilibration w_left from exact matrix-free row norms (mean(w^2)=1)
       - Right dyadic Sobolev weights d_s_inv = 2^{-j s}
     """
     r_norms = compute_fast_row_norms(op)
@@ -421,7 +513,73 @@ def make_two_sided_operator(op: RetardedSIVIEOperator, hdp: TwoSidedHDP) -> Line
 
 
 # ============================================================================
-# 4. Paige-Saunders LSQR with Discrepancy-Based Stopping Criterion (DSC)
+# 4. O(N) Tridiagonal H^1 (s = 1) Right Preconditioner Baseline
+# ============================================================================
+
+@dataclass
+class H1Preconditioner:
+    U_band: np.ndarray
+    L_band: np.ndarray
+    op: RetardedSIVIEOperator
+    w_left: np.ndarray
+
+    def y_to_c(self, y: np.ndarray) -> np.ndarray:
+        x_node = solve_banded((0, 1), self.U_band, y)
+        return self.op.nodes_to_coeffs(x_node)
+
+    def c_adj_to_y(self, r_c: np.ndarray) -> np.ndarray:
+        x_adj = self.op.nodes_to_coeffs_adjoint(r_c)
+        return solve_banded((1, 0), self.L_band, x_adj)
+
+
+def build_h1_preconditioner(
+    op: RetardedSIVIEOperator,
+    t_grid: np.ndarray,
+    w_left: np.ndarray,
+    alpha: float = 0.05,
+) -> H1Preconditioner:
+    """
+    Build O(N) SPD tridiagonal H^1 metric G = W_q + alpha^2 D_t^T W_{dt} D_t = U^T U
+    on collocation nodes t_grid, returning banded Cholesky factors for right preconditioning.
+    """
+    t_flat = t_grid.ravel()
+    N = t_flat.size
+    dt = np.diff(t_flat)
+    w_q = np.empty(N, dtype=float)
+    w_q[0] = 0.5 * dt[0] + t_flat[0]
+    w_q[-1] = 0.5 * dt[-1] + (op.T_end - t_flat[-1])
+    w_q[1:-1] = 0.5 * (dt[:-1] + dt[1:])
+
+    inv_dt = (alpha ** 2) / dt
+    diag = w_q.copy()
+    diag[:-1] += inv_dt
+    diag[1:] += inv_dt
+    off = -inv_dt
+
+    ab = np.zeros((2, N), dtype=float)
+    ab[0, 1:] = off
+    ab[1, :] = diag
+    U_band = cholesky_banded(ab, lower=False)
+
+    L_band = np.zeros((2, N), dtype=float)
+    L_band[0, :] = U_band[1, :]
+    L_band[1, :-1] = U_band[0, 1:]
+    return H1Preconditioner(U_band=U_band, L_band=L_band, op=op, w_left=w_left)
+
+
+def make_h1_operator(h1_prec: H1Preconditioner) -> LinearOperator:
+    op = h1_prec.op
+    w_left = h1_prec.w_left
+    return LinearOperator(
+        dtype=float,
+        shape=op.shape,
+        matvec=lambda y: w_left * op.matvec(h1_prec.y_to_c(y)),
+        rmatvec=lambda u: h1_prec.c_adj_to_y(op.rmatvec(w_left * u)),
+    )
+
+
+# ============================================================================
+# 5. Paige-Saunders LSQR with DSC & Hybrid Golub-Kahan (DP / GCV)
 # ============================================================================
 
 @dataclass
@@ -430,6 +588,7 @@ class LSQRResult:
     m_stop: int
     omega_history: np.ndarray
     c_history: Optional[List[np.ndarray]] = None
+    lam_opt: float = 0.0
 
 
 def solve_plsqr_dsc(
@@ -443,6 +602,7 @@ def solve_plsqr_dsc(
     m_max: int = 200,
     use_dsc: bool = True,
     record_history: bool = False,
+    y_to_c_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
 ) -> LSQRResult:
     """Paige-Saunders LSQR with O(1) residual monitoring and Discrepancy-Based Stopping (DSC)."""
     N = len(b_L)
@@ -460,6 +620,7 @@ def solve_plsqr_dsc(
     omega_hist: List[float] = [phi_bar]
     c_hist: Optional[List[np.ndarray]] = [] if record_history else None
     m_stop = m_max
+    map_c = y_to_c_fn if y_to_c_fn is not None else (lambda vec: d_s_inv * vec)
 
     for m in range(1, m_max + 1):
         p_vec = A_tilde.matvec(v) - alpha * u
@@ -488,7 +649,7 @@ def solve_plsqr_dsc(
         omega_hist.append(omega)
 
         if record_history and c_hist is not None:
-            c_hist.append(d_s_inv * y)
+            c_hist.append(map_c(y))
 
         if use_dsc and m >= m_min:
             omega_prev = omega_hist[-2]
@@ -500,15 +661,134 @@ def solve_plsqr_dsc(
                 break
 
     return LSQRResult(
-        c_sol=d_s_inv * y,
+        c_sol=map_c(y),
         m_stop=m_stop,
         omega_history=np.asarray(omega_hist),
         c_history=c_hist,
     )
 
 
+def solve_hybrid_gk(
+    A_tilde: LinearOperator,
+    b_L: np.ndarray,
+    d_s_inv: np.ndarray,
+    mode: str = "gcv",
+    delta_prior: float = 0.0,
+    tau_safe: float = 1.10,
+    m_min: int = 4,
+    m_max: int = 80,
+) -> LSQRResult:
+    """
+    Hybrid Golub-Kahan (HGK) solver: applies Golub-Kahan bidiagonalization to A_tilde
+    and solves projected Tikhonov subproblems with automatic parameter selection:
+      - mode="dp": Morozov discrepancy principle on projected residual
+      - mode="gcv": Generalized Cross-Validation on projected bidiagonal system
+    """
+    N = len(b_L)
+    beta1 = float(np.linalg.norm(b_L))
+    if beta1 == 0.0:
+        return LSQRResult(c_sol=np.zeros(N), m_stop=0, omega_history=np.array([0.0]))
+
+    u = b_L / beta1
+    q0 = A_tilde.rmatvec(u)
+    alpha = float(np.linalg.norm(q0))
+    v = q0 / alpha if alpha > 0.0 else np.zeros(N, dtype=float)
+
+    V_basis: List[np.ndarray] = [v]
+    alphas: List[float] = [alpha]
+    betas: List[float] = []
+    omega_hist: List[float] = [beta1]
+
+    lam_prev = None
+    lam_opt = 0.0
+    z_best = np.zeros(1)
+    m_stop = m_max
+
+    for m in range(1, m_max + 1):
+        p_vec = A_tilde.matvec(V_basis[-1]) - alphas[-1] * u
+        beta_next = float(np.linalg.norm(p_vec))
+        betas.append(beta_next)
+        u = p_vec / beta_next if beta_next > 1e-15 else np.zeros(N, dtype=float)
+
+        q_vec = A_tilde.rmatvec(u) - beta_next * V_basis[-1]
+        alpha_next = float(np.linalg.norm(q_vec))
+
+        B_m = np.zeros((m + 1, m), dtype=float)
+        for j in range(m):
+            B_m[j, j] = alphas[j]
+            B_m[j + 1, j] = betas[j]
+
+        U_b, s_b, Vt_b = np.linalg.svd(B_m, full_matrices=True)
+        g_proj = beta1 * U_b[0, :]  # length m + 1
+        tail_sq = float(g_proj[m] ** 2)
+        omega_hist.append(float(np.sqrt(tail_sq)))
+
+        def res_sq_fn(lam: float) -> float:
+            f_rem = (lam ** 2) / (s_b ** 2 + lam ** 2)
+            return float(np.sum((f_rem * g_proj[:m]) ** 2) + tail_sq)
+
+        if mode == "dp":
+            target = tau_safe * delta_prior
+            res0 = np.sqrt(res_sq_fn(0.0))
+            if res0 <= target:
+                lam_opt = float(
+                    brentq(
+                        lambda l: np.sqrt(res_sq_fn(l)) - target,
+                        0.0,
+                        max(1e3 * s_b[0], 1.0),
+                    )
+                )
+            else:
+                lam_opt = 0.0
+        elif mode == "gcv":
+            lo = np.log10(max(s_b[-1] * 1e-3, 1e-12 * s_b[0]))
+            hi = np.log10(max(10.0 * s_b[0], 1e-6))
+
+            def gcv_obj(log_lam: float) -> float:
+                lam = 10.0 ** log_lam
+                df = float(np.sum((s_b ** 2) / (s_b ** 2 + lam ** 2)))
+                denom = max((m + 1) - df, 1e-12)
+                return ((m + 1) * res_sq_fn(lam)) / (denom ** 2)
+
+            opt = minimize_scalar(gcv_obj, bounds=(lo, hi), method="bounded")
+            lam_opt = float(10.0 ** opt.x)
+        else:
+            raise ValueError(f"Unknown Hybrid GK mode: {mode}")
+
+        filt = s_b / (s_b ** 2 + lam_opt ** 2)
+        z_best = Vt_b.T @ (filt * g_proj[:m])
+
+        stop_now = False
+        if m >= m_min:
+            if mode == "dp" and np.sqrt(res_sq_fn(0.0)) <= tau_safe * delta_prior:
+                if lam_prev is not None and lam_opt > 0.0:
+                    if abs(lam_opt - lam_prev) / max(lam_opt, 1e-15) < 1e-2:
+                        stop_now = True
+            elif mode == "gcv":
+                if lam_prev is not None and abs(lam_opt - lam_prev) / max(lam_opt, 1e-15) < 5e-3:
+                    stop_now = True
+
+        lam_prev = lam_opt
+        if stop_now or alpha_next < 1e-15:
+            m_stop = m
+            break
+
+        if m < m_max:
+            alphas.append(alpha_next)
+            V_basis.append(q_vec / alpha_next)
+
+    V_mat = np.column_stack(V_basis[: z_best.size])
+    y_sol = V_mat @ z_best
+    return LSQRResult(
+        c_sol=d_s_inv * y_sol,
+        m_stop=m_stop,
+        omega_history=np.asarray(omega_hist),
+        lam_opt=lam_opt,
+    )
+
+
 # ============================================================================
-# 5. Self-Tests (Unitarity, Adjoint, and O(R^2 N) Row Norm Exactness)
+# 6. Self-Tests (Unitarity, Adjoint, Row Norms, Chebyshev Kernel, H^1 Adjoint)
 # ============================================================================
 
 def run_self_tests() -> None:
@@ -523,15 +803,22 @@ def run_self_tests() -> None:
     c_rec = fwt_analysis(f_syn, k, basis)
     err_fwt = np.linalg.norm(c_rand - c_rec) / np.linalg.norm(c_rand)
     assert err_fwt < 1e-13, f"FWT test failed: {err_fwt}"
-    print(f"  [PASS] Multi-level SKCW FWT unitary check: err = {err_fwt:.2e}")
+    print(f"  [PASS] Multi-level FWT unitary check: err = {err_fwt:.2e}")
 
     t_grid = RetardedSIVIEOperator.collocation_grid(k, p, basis=basis)
-    a0 = 4.0 * np.exp(3.0 * t_grid) * np.exp(-2.0 * (t_grid - 0.5))
-    b0 = np.exp(2.0 * (t_grid - 0.5))
+    k0_fn = lambda t, s: (2.0 + np.sin(2.0 * np.pi * t)) * np.exp(-2.0 * (t - s) ** 2)
+    K0 = chebyshev_separable_kernel(k0_fn, t_grid, R=18, T_end=1.0)
+    K0_exact = k0_fn(t_grid.ravel()[:, None], t_grid.ravel()[None, :])
+    K0_approx = sum(
+        np.outer(a.ravel(), b.ravel()) for a, b in zip(K0.a_factors, K0.b_factors)
+    )
+    err_sep = np.max(np.abs(K0_exact - K0_approx))
+    assert err_sep < 1e-10, f"Chebyshev separable expansion failed: {err_sep}"
+    print(f"  [PASS] Non-separable Gaussian kernel (R=18): max err = {err_sep:.2e}")
+
     a1 = 1.2 * np.exp(-1.5 * t_grid) * np.exp(-1.0 * (t_grid - 0.5))
     b1 = np.exp(1.0 * (t_grid - 0.5))
     a2 = 0.25 * (1.0 + 0.5 * np.sin(2.0 * np.pi * t_grid))
-    K0 = SeparableKernel([a0], [b0])
     K1 = SeparableKernel([a1], [b1])
     K2 = SeparableKernel([a2], [np.ones_like(t_grid)])
     dW = rng.normal(0.0, np.sqrt(1.0 / (1 << (k - 1))), size=(1 << (k - 1)))
@@ -550,7 +837,16 @@ def run_self_tests() -> None:
     r_fast = compute_fast_row_norms(op)
     err_rows = np.max(np.abs(r_exact - r_fast)) / np.max(r_exact)
     assert err_rows < 1e-13, f"Fast row norm mismatch: {err_rows}"
-    print(f"  [PASS] O(R^2 N) Row norm vs Explicit A: rel_err = {err_rows:.2e}")
+    print(f"  [PASS] O(R^2 N) Row norm (R_tot=20) vs Explicit A: rel_err = {err_rows:.2e}")
+
+    hdp = build_two_sided_hdp(op, s=0.6)
+    h1_prec = build_h1_preconditioner(op, t_grid, hdp.w_left, alpha=0.05)
+    A_h1 = make_h1_operator(h1_prec)
+    lhs_h1 = float(np.dot(A_h1.matvec(v), u))
+    rhs_h1 = float(np.dot(v, A_h1.rmatvec(u)))
+    err_h1 = abs(lhs_h1 - rhs_h1) / max(abs(lhs_h1), 1.0)
+    assert err_h1 < 1e-13, f"H^1 adjoint test failed: {err_h1}"
+    print(f"  [PASS] Tridiagonal H^1 preconditioner adjoint check: rel_err = {err_h1:.2e}")
 
 
 if __name__ == "__main__":
